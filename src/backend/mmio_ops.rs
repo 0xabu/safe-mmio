@@ -15,7 +15,11 @@ fn convert<T: Immutable + IntoBytes, U: FromBytes>(value: T) -> U {
 /// GHCB protocol needs to know the exact access size for VMGEXIT calls).
 ///
 /// The pointer is guaranteed to be properly aligned for its type and to point to valid MMIO address
-/// space.
+/// space. Note that `read_*` and `write_*` may be called concurrently from multiple threads on the
+/// same address when accessing [`ReadPure`](crate::fields::ReadPure),
+/// [`ReadPureWrite`](crate::fields::ReadPureWrite), [`WriteShared`](crate::fields::WriteShared),
+/// [`ReadWriteShared`](crate::fields::ReadWriteShared), or
+/// [`ReadPureWriteShared`](crate::fields::ReadPureWriteShared) fields.
 pub trait MmioOps {
     /// Perform an 8-bit MMIO read.
     ///

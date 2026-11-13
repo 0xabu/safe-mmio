@@ -71,14 +71,19 @@ field!(uart_registers, data).write(b'x');
 
 Methods are also provided to go from a `UniqueMmioPointer` to an array or slice to its elements.
 
-### Pure reads vs. side-effects
+### Pure reads, shared writes, and side-effects
 
-We distinguish between fields which for which MMIO reads may have side effects (e.g. popping a byte
+We distinguish between fields for which MMIO reads may have side effects (e.g. popping a byte
 from the UART's receive FIFO or clearing an interrupt status) and those for which reads are 'pure'
-with no side-effects. Reading from a `ReadOnly` or `ReadWrite` field is assumed to have
-side-effects, whereas reading from a `ReadPure` or `ReadPureWrite` must not. Reading from a
-`ReadOnly` or `ReadWrite` field requires an `&mut UniqueMmioPointer` (the same as writing), whereas
-reading from a `ReadPure` or `ReadPureWrite` field can be done with an `&UniqueMmioPointer` or
+with no side-effects. Reading from a `ReadOnly`, `ReadWrite`, or `ReadWriteShared` field is assumed
+to have side-effects and requires an `&mut UniqueMmioPointer`, whereas reading from a `ReadPure`,
+`ReadPureWrite`, or `ReadPureWriteShared` field has no side-effects and can be done via an
+`&UniqueMmioPointer` or `&SharedMmioPointer`.
+
+Likewise, writing to a `WriteOnly`, `ReadWrite`, or `ReadPureWrite` field requires exclusive access
+via `&mut UniqueMmioPointer`, whereas writing to a `WriteShared`, `ReadWriteShared`, or
+`ReadPureWriteShared` field (such as write-1-to-set / write-1-to-clear interrupt controller
+registers or a shared transmit FIFO) can be done concurrently via `&UniqueMmioPointer` or
 `&SharedMmioPointer`.
 
 ### Physical addresses

@@ -15,7 +15,10 @@ mod physical;
 
 use crate::backend::Ops;
 pub use crate::backend::mmio_ops::MmioOps;
-use crate::fields::{ReadOnly, ReadPure, ReadPureWrite, ReadWrite, WriteOnly};
+use crate::fields::{
+    ReadOnly, ReadPure, ReadPureWrite, ReadPureWriteShared, ReadWrite, ReadWriteShared, WriteOnly,
+    WriteShared,
+};
 use core::{
     array,
     fmt::Debug,
@@ -26,6 +29,18 @@ use core::{
 pub use physical::PhysicalInstance;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+const fn assert_single_shared_access<T>() {
+    assert!(
+        matches!(size_of::<T>(), 1 | 2 | 4)
+            || (cfg!(target_pointer_width = "64") && size_of::<T>() == 8),
+        "shared-writable MMIO fields must be 1, 2, or 4 bytes (or 8 bytes on 64-bit targets)",
+    );
+    assert!(
+        align_of::<T>() >= size_of::<T>(),
+        "shared-writable MMIO fields must have alignment at least equal to their size",
+    );
+}
+
 /// A unique owned pointer to the registers of some MMIO device.
 ///
 /// It is guaranteed to be valid and unique; no other access to the MMIO space of the device may
@@ -33,7 +48,12 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 ///
 /// A `UniqueMmioPointer` may be created from a mutable reference, but this should only be used for
 /// testing purposes, as references should never be constructed for real MMIO address space.
-pub struct UniqueMmioPointer<'a, T: ?Sized>(SharedMmioPointer<'a, T>);
+pub struct UniqueMmioPointer<'a, T: ?Sized>(
+    // Safety invariant: In addition to `SharedMmioPointer`'s safety invariant, for the lifetime
+    // `'a` (while this `UniqueMmioPointer` exists and is not borrowed via `as_shared`), no other
+    // pointer or reference may be used to access the same MMIO region.
+    SharedMmioPointer<'a, T>,
+);
 
 // Implement Debug, Eq and PartialEq manually rather than deriving to avoid an unneccessary bound on
 // T.
@@ -54,18 +74,30 @@ impl<T: ?Sized> PartialEq for UniqueMmioPointer<'_, T> {
 
 impl<T: ?Sized> Eq for UniqueMmioPointer<'_, T> {}
 
-impl<T: ?Sized> UniqueMmioPointer<'_, T> {
+impl<'a, T: ?Sized> UniqueMmioPointer<'a, T> {
     /// Creates a new `UniqueMmioPointer` from a non-null raw pointer.
     ///
     /// # Safety
     ///
-    /// `regs` must be a properly aligned and valid pointer to some MMIO address space of type T,
-    /// which is mapped as device memory and valid to read and write from any thread with volatile
-    /// operations. There must not be any other aliases which are used to access the same MMIO
-    /// region while this `UniqueMmioPointer` exists.
-    ///
-    /// If `T` contains any fields wrapped in [`ReadOnly`], [`WriteOnly`] or [`ReadWrite`] then they
-    /// must indeed be safe to perform MMIO reads or writes on.
+    /// The caller must ensure that for the lifetime `'a`:
+    /// - `regs` is a properly aligned and valid pointer to some MMIO address space of type `T`,
+    ///   mapped as device memory and valid to read and write from any thread with volatile / MMIO
+    ///   operations.
+    /// - No other aliases (other than pointers derived from the returned `UniqueMmioPointer`) are
+    ///   used to access the same MMIO region.
+    /// - Any fields in `T` wrapped in [`ReadOnly`], [`WriteOnly`], [`ReadWrite`], [`ReadPure`],
+    ///   [`ReadPureWrite`], [`WriteShared`], [`ReadWriteShared`], or [`ReadPureWriteShared`] are
+    ///   safe to perform the corresponding MMIO reads or writes on:
+    ///   - [`ReadOnly`], [`WriteOnly`], and [`ReadWrite`]: safe to read/write with exclusive
+    ///     access.
+    ///   - [`ReadPure`] and [`ReadPureWrite`]: reads have no side-effects and are safe to perform
+    ///     concurrently from multiple threads or cores, and writes to [`ReadPureWrite`] are safe
+    ///     with exclusive access.
+    ///   - [`WriteShared`]: safe to write concurrently from multiple threads or cores.
+    ///   - [`ReadWriteShared`]: safe to write concurrently from multiple threads or cores
+    ///     (including concurrently with an exclusive read), and safe to read with exclusive access.
+    ///   - [`ReadPureWriteShared`]: reads have no side-effects, and both reads and writes are safe
+    ///     to perform concurrently from multiple threads or cores.
     pub const unsafe fn new(regs: NonNull<T>) -> Self {
         Self(SharedMmioPointer {
             regs,
@@ -272,6 +304,63 @@ impl<T: Immutable + IntoBytes> UniqueMmioPointer<'_, WriteOnly<T>> {
         unsafe {
             self.write_unsafe(WriteOnly(value));
         }
+    }
+}
+
+impl<T: Immutable + IntoBytes> UniqueMmioPointer<'_, WriteShared<T>> {
+    /// Performs an MMIO write of the entire `T`.
+    pub fn write(&self, value: T) {
+        self.0.write(value);
+    }
+}
+
+impl<T: FromBytes + IntoBytes> UniqueMmioPointer<'_, ReadWriteShared<T>> {
+    /// Performs an MMIO read of the entire `T`.
+    ///
+    /// Unlike [`write`](Self::write), reading from a [`ReadWriteShared`] field may have
+    /// side-effects and therefore requires `&mut self`:
+    ///
+    /// ```compile_fail
+    /// use safe_mmio::{UniqueMmioPointer, fields::ReadWriteShared};
+    ///
+    /// fn read_shared_ref(ptr: &UniqueMmioPointer<ReadWriteShared<u32>>) -> u32 {
+    ///     ptr.write(1);
+    ///     ptr.read()
+    /// }
+    /// ```
+    pub fn read(&mut self) -> T {
+        const { assert_single_shared_access::<T>() };
+        // SAFETY:
+        // - `ReadWriteShared<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`, which has the
+        //   same size and alignment as `T` per `core::cell::UnsafeCell` layout rules.
+        // - `assert_single_shared_access::<T>()` guarantees `size_of::<T>()` is 1, 2, 4 (or 8 on
+        //   64-bit targets) and `align_of::<T>() >= size_of::<T>()`.
+        // - By the safety invariant of `UniqueMmioPointer` and `SharedMmioPointer::regs`,
+        //   `self.0.regs` is properly aligned for `T`, exclusively borrowed via `&mut self`, and
+        //   points to a `ReadWriteShared<T>` field that is valid for an exclusive MMIO read of
+        //   `size_of::<T>()` bytes.
+        unsafe { Ops::read(self.0.regs.cast::<T>()) }
+    }
+}
+
+impl<T: Immutable + IntoBytes> UniqueMmioPointer<'_, ReadWriteShared<T>> {
+    /// Performs an MMIO write of the entire `T`.
+    pub fn write(&self, value: T) {
+        self.0.write(value);
+    }
+}
+
+impl<T: FromBytes + IntoBytes> UniqueMmioPointer<'_, ReadPureWriteShared<T>> {
+    /// Performs an MMIO read of the entire `T`.
+    pub fn read(&self) -> T {
+        self.0.read()
+    }
+}
+
+impl<T: Immutable + IntoBytes> UniqueMmioPointer<'_, ReadPureWriteShared<T>> {
+    /// Performs an MMIO write of the entire `T`.
+    pub fn write(&self, value: T) {
+        self.0.write(value);
     }
 }
 
@@ -708,6 +797,12 @@ impl<'a, T> Iterator for UniqueMmioPointerIterator<'a, T> {
 ///
 /// It is guaranteed to be valid but unlike [`UniqueMmioPointer`] may not be unique.
 pub struct SharedMmioPointer<'a, T: ?Sized> {
+    // Safety invariant: For the lifetime `'a`, `regs` is properly aligned for `T` and either:
+    // 1. Points to an initialized value of type `T` with shared read validity for `'a` (and any
+    //    `WriteShared`, `ReadWriteShared`, or `ReadPureWriteShared` subfields are uninhabited
+    //    zero-length slices or arrays), or
+    // 2. Points to device MMIO address space of type `T` that is valid for concurrent accesses
+    //    from any thread according to the wrapper types in `T`.
     regs: NonNull<T>,
     phantom: PhantomData<&'a T>,
 }
@@ -775,6 +870,24 @@ impl<'a, T: ?Sized> SharedMmioPointer<'a, T> {
 // be accessed from any thread.
 unsafe impl<T: ?Sized + Send + Sync> Send for SharedMmioPointer<'_, T> {}
 
+// SAFETY:
+// - By the safety invariant of `SharedMmioPointer::regs`, `self.regs` is either backed by a Rust
+//   allocation of type `T` or by device MMIO memory.
+// - If backed by a Rust allocation (`From<&T>` or `From<&mut T>`), `T` cannot contain any
+//   inhabited `WriteShared`, `ReadWriteShared`, or `ReadPureWriteShared` fields because those
+//   types have no safe value constructors; consequently, safe `&self` methods on
+//   `SharedMmioPointer` and `UniqueMmioPointer` can only perform pure reads (`ReadPure::read` and
+//   `ReadPureWrite::read`), which are race-free across threads when `T: Sync`, and `T: Send`
+//   permits returning the read value on the calling thread.
+// - If backed by device MMIO memory (`UniqueMmioPointer::new` or `child` / `split_child`), the
+//   caller of `UniqueMmioPointer::new` guarantees that the MMIO registers are valid for concurrent
+//   accesses from any thread according to the wrapper types in `T`, and `T: Send + Sync` permits
+//   transferring values of `T` across threads.
+// - On `&UniqueMmioPointer`, all `&self` methods (`ptr`, `as_shared`, `len`, `is_empty`,
+//   `as_slice`, pure `read`, and shared `write`) perform only shared-safe operations, and sharing
+//   `&UniqueMmioPointer` prevents any `&mut self` exclusive access for the duration of the borrow.
+unsafe impl<T: ?Sized + Send + Sync> Sync for SharedMmioPointer<'_, T> {}
+
 impl<'a, T: ?Sized> From<&'a T> for SharedMmioPointer<'a, T> {
     fn from(r: &'a T) -> Self {
         Self {
@@ -807,6 +920,106 @@ impl<T: FromBytes + IntoBytes> SharedMmioPointer<'_, ReadPureWrite<T>> {
         // being wrapped in `ReadPureWrite` implies that it is safe to read from a shared reference
         // because doing so has no side-effects.
         unsafe { self.read_unsafe().0 }
+    }
+}
+
+impl<T: Immutable + IntoBytes> SharedMmioPointer<'_, WriteShared<T>> {
+    /// Performs an MMIO write of the entire `T`.
+    ///
+    /// Reading from a [`WriteShared`] pointer is not permitted:
+    ///
+    /// ```compile_fail
+    /// use safe_mmio::{SharedMmioPointer, fields::WriteShared};
+    ///
+    /// fn try_read(ptr: SharedMmioPointer<WriteShared<u32>>) {
+    ///     let _ = ptr.read();
+    /// }
+    /// ```
+    pub fn write(&self, value: T) {
+        const { assert_single_shared_access::<T>() };
+        // SAFETY:
+        // - `WriteShared<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`, which has the same
+        //   size and alignment as `T` per `core::cell::UnsafeCell` layout rules.
+        // - `assert_single_shared_access::<T>()` guarantees `size_of::<T>()` is 1, 2, 4 (or 8 on
+        //   64-bit targets) and `align_of::<T>() >= size_of::<T>()`.
+        // - By the safety invariant of `SharedMmioPointer::regs` (and because `WriteShared<T>`
+        //   cannot be constructed in safe code for `From<&T>` / `From<&mut T>`), `self.regs` is
+        //   properly aligned for `T` and points to a `WriteShared<T>` MMIO register that is valid
+        //   for concurrent MMIO writes of `size_of::<T>()` bytes from a shared reference.
+        unsafe {
+            Ops::write(self.regs.cast::<T>(), value);
+        }
+    }
+}
+
+impl<T: Immutable + IntoBytes> SharedMmioPointer<'_, ReadWriteShared<T>> {
+    /// Performs an MMIO write of the entire `T`.
+    ///
+    /// Reading from a [`ReadWriteShared`] field has side-effects and so is only permitted via
+    /// `&mut UniqueMmioPointer`, not `SharedMmioPointer`:
+    ///
+    /// ```compile_fail
+    /// use safe_mmio::{SharedMmioPointer, fields::ReadWriteShared};
+    ///
+    /// fn try_read(ptr: SharedMmioPointer<ReadWriteShared<u32>>) {
+    ///     let _ = ptr.read();
+    /// }
+    /// ```
+    pub fn write(&self, value: T) {
+        const { assert_single_shared_access::<T>() };
+        // SAFETY:
+        // - `ReadWriteShared<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`, which has the
+        //   same size and alignment as `T` per `core::cell::UnsafeCell` layout rules.
+        // - `assert_single_shared_access::<T>()` guarantees `size_of::<T>()` is 1, 2, 4 (or 8 on
+        //   64-bit targets) and `align_of::<T>() >= size_of::<T>()`.
+        // - By the safety invariant of `SharedMmioPointer::regs` (and because `ReadWriteShared<T>`
+        //   cannot be constructed in safe code for `From<&T>` / `From<&mut T>`), `self.regs` is
+        //   properly aligned for `T` and points to a `ReadWriteShared<T>` MMIO register that is
+        //   valid for concurrent MMIO writes of `size_of::<T>()` bytes from a shared reference.
+        unsafe {
+            Ops::write(self.regs.cast::<T>(), value);
+        }
+    }
+}
+
+impl<T: FromBytes + IntoBytes> SharedMmioPointer<'_, ReadPureWriteShared<T>> {
+    /// Performs an MMIO read of the entire `T`.
+    pub fn read(&self) -> T {
+        const { assert_single_shared_access::<T>() };
+        // SAFETY:
+        // - `ReadPureWriteShared<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`, which has the
+        //   same size and alignment as `T` per `core::cell::UnsafeCell` layout rules.
+        // - `assert_single_shared_access::<T>()` guarantees `size_of::<T>()` is 1, 2, 4 (or 8 on
+        //   64-bit targets) and `align_of::<T>() >= size_of::<T>()`.
+        // - By the safety invariant of `SharedMmioPointer::regs` (and because
+        //   `ReadPureWriteShared<T>` cannot be constructed in safe code for `From<&T>` /
+        //   `From<&mut T>`), `self.regs` is properly aligned for `T` and points to a
+        //   `ReadPureWriteShared<T>` MMIO register that is valid for concurrent side-effect-free
+        //   MMIO reads of `size_of::<T>()` bytes from a shared reference.
+        unsafe { Ops::read(self.regs.cast::<T>()) }
+    }
+}
+
+impl<T: Immutable + IntoBytes> SharedMmioPointer<'_, ReadPureWriteShared<T>> {
+    /// Performs an MMIO write of the entire `T`.
+    ///
+    /// `T` must be 1, 2, or 4 bytes (or 8 bytes on 64-bit targets) with alignment at least equal
+    /// to its size.
+    pub fn write(&self, value: T) {
+        const { assert_single_shared_access::<T>() };
+        // SAFETY:
+        // - `ReadPureWriteShared<T>` is `#[repr(transparent)]` over `UnsafeCell<T>`, which has the
+        //   same size and alignment as `T` per `core::cell::UnsafeCell` layout rules.
+        // - `assert_single_shared_access::<T>()` guarantees `size_of::<T>()` is 1, 2, 4 (or 8 on
+        //   64-bit targets) and `align_of::<T>() >= size_of::<T>()`.
+        // - By the safety invariant of `SharedMmioPointer::regs` (and because
+        //   `ReadPureWriteShared<T>` cannot be constructed in safe code for `From<&T>` /
+        //   `From<&mut T>`), `self.regs` is properly aligned for `T` and points to a
+        //   `ReadPureWriteShared<T>` MMIO register that is valid for concurrent MMIO writes of
+        //   `size_of::<T>()` bytes from a shared reference.
+        unsafe {
+            Ops::write(self.regs.cast::<T>(), value);
+        }
     }
 }
 
@@ -1869,5 +2082,95 @@ mod tests {
             field_shared!(shared, u32_pair).read(),
             [0x1122_3344, 0x5566_7788]
         );
+    }
+
+    #[test]
+    fn shared_write_fields() {
+        use core::mem::MaybeUninit;
+
+        #[repr(transparent)]
+        #[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+        struct EnableFlags(u32);
+
+        #[repr(C)]
+        struct SharedRegs {
+            ws: WriteShared<u32>,
+            rws: ReadWriteShared<u32>,
+            rpws8: ReadPureWriteShared<u8>,
+            rpws16: ReadPureWriteShared<u16>,
+            rpws32: ReadPureWriteShared<EnableFlags>,
+            #[cfg(target_pointer_width = "64")]
+            rpws64: ReadPureWriteShared<u64>,
+            isenabler: [ReadPureWriteShared<u32>; 4],
+        }
+
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SharedRegs>();
+        assert_send_sync::<SharedMmioPointer<'static, SharedRegs>>();
+        assert_send_sync::<UniqueMmioPointer<'static, SharedRegs>>();
+
+        let mut backing = MaybeUninit::<SharedRegs>::zeroed();
+        let ptr = NonNull::new(backing.as_mut_ptr()).unwrap();
+        // SAFETY: `ptr` points to a properly aligned, zero-initialized local allocation of
+        // `SharedRegs`, and all accesses in this test are single-threaded.
+        let mut unique: UniqueMmioPointer<SharedRegs> = unsafe { UniqueMmioPointer::new(ptr) };
+
+        // Write and read through `UniqueMmioPointer` (note `write` and pure `read` only need
+        // `&self`, whereas side-effecting `ReadWriteShared::read` takes `&mut self`).
+        {
+            let ws = field!(unique, ws);
+            ws.write(0x1111_2222);
+
+            let mut rws = field!(unique, rws);
+            rws.write(0x3333_4444);
+            assert_eq!(rws.read(), 0x3333_4444);
+
+            let rpws32 = field!(unique, rpws32);
+            rpws32.write(EnableFlags(0x5555_6666));
+            assert_eq!(rpws32.read(), EnableFlags(0x5555_6666));
+        }
+
+        // Write and read through `field_shared!` on `UniqueMmioPointer` (borrowing `&unique`).
+        field_shared!(unique, ws).write(0xAAAA_BBBB);
+        field_shared!(unique, rws).write(0xCCCC_DDDD);
+        field_shared!(unique, rpws8).write(0x12);
+        field_shared!(unique, rpws16).write(0x3456);
+        field_shared!(unique, rpws32).write(EnableFlags(0x789A_BCDE));
+        #[cfg(target_pointer_width = "64")]
+        field_shared!(unique, rpws64).write(0x0123_4567_89AB_CDEF);
+
+        assert_eq!(field!(unique, rws).read(), 0xCCCC_DDDD);
+
+        // Convert to `SharedMmioPointer` and access via multiple copies concurrently in scope.
+        let shared1: SharedMmioPointer<SharedRegs> = unique.into();
+        let shared2 = shared1;
+
+        assert_eq!(field_shared!(shared1, rpws8).read(), 0x12);
+        assert_eq!(field_shared!(shared2, rpws16).read(), 0x3456);
+        assert_eq!(
+            field_shared!(shared1, rpws32).read(),
+            EnableFlags(0x789A_BCDE)
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(field_shared!(shared2, rpws64).read(), 0x0123_4567_89AB_CDEF);
+
+        let isenabler1 = field_shared!(shared1, isenabler).as_slice();
+        let isenabler2 = field_shared!(shared2, isenabler);
+        isenabler1.get(0).unwrap().write(1 << 0);
+        isenabler2.get(1).unwrap().write(1 << 5);
+        for (i, elem) in isenabler1.get_range(2..4).unwrap().iter().enumerate() {
+            elem.write(1 << (i + 10));
+        }
+
+        let parts = isenabler2.split();
+        assert_eq!(parts[0].read(), 1 << 0);
+        assert_eq!(parts[1].read(), 1 << 5);
+        assert_eq!(parts[2].read(), 1 << 10);
+        assert_eq!(parts[3].read(), 1 << 11);
+
+        // Verify the underlying backing memory for the write-only field as well.
+        // SAFETY: The first field `ws` is at offset 0 and was written with `0xAAAA_BBBB`.
+        let ws_val = unsafe { backing.as_ptr().cast::<u32>().read_volatile() };
+        assert_eq!(ws_val, 0xAAAA_BBBB);
     }
 }

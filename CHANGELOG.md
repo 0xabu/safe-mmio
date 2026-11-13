@@ -1,6 +1,15 @@
 # Changelog
 
-### 0.4.0
+### Unreleased
+
+### New features
+
+- Added `WriteShared`, `ReadWriteShared`, and `ReadPureWriteShared` field wrapper types to support
+  registers that may safely be written via shared `SharedMmioPointer` (or `&UniqueMmioPointer`)
+  references.
+- Implemented `Sync` for `SharedMmioPointer` (and `UniqueMmioPointer`).
+
+## 0.4.0
 
 ### Breaking changes
 
